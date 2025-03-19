@@ -1,4 +1,218 @@
+import os
+import logging
+from transformers import AutoFeatureExtractor, AutoModelForObjectDetection
+from ultralytics import YOLO
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Base path loaded from environment variable (fallback to default if not set)
+BASE_PATH = os.getenv('BASE_PATH', '/home/jovyan/work/Sagar/')
+
+class LoadModels:
+    """
+    Class to load different AI models including YOLO and Table Transformer.
+    """
+    def __init__(self):
+        logging.info("Initializing LoadModels class...")
+
+    def load_yolo_model(self, model_path: str = None) -> YOLO:
+        """
+        Load YOLO model from the specified path.
+        :param model_path: Path to the YOLO model weights file.
+        :return: Loaded YOLO model.
+        """
+        if model_path is None:
+            model_path = os.path.join(BASE_PATH, 'yolo_layout_model/yolov11x_best.pt')
+        
+        try:
+            model = YOLO(model_path)
+            logging.info("YOLO Model Loaded Successfully.")
+            return model
+        except Exception as e:
+            logging.error(f"Error loading YOLO model: {e}")
+            raise
     
+    def load_table_model(self, model_name: str = None):
+        """
+        Load the Table Transformer model.
+        :param model_name: Path to the pre-trained model directory.
+        :return: Tuple containing the feature extractor and model.
+        """
+        if model_name is None:
+            model_name = os.path.join(BASE_PATH, 'table_transformer_structure_recog_model')
+        
+        try:
+            feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+            model = AutoModelForObjectDetection.from_pretrained(
+                pretrained_model_name_or_path=model_name,
+                use_pretrained_backbone=False,
+                local_files_only=True,
+                cache_dir=model_name
+            )
+            logging.info("Table Model Loaded Successfully.")
+            return feature_extractor, model
+        except Exception as e:
+            logging.error(f"Error loading Table model: {e}")
+            raise
+
+# Example usage
+if __name__ == "__main__":
+    loader = LoadModels()
+    yolo_model = loader.load_yolo_model()
+    table_feature_extractor, table_model = loader.load_table_model()
+
+import logging
+import base64
+import torch
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from typing import List, Tuple, Dict, Any
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ExtractTable:
+    def __init__(self, model_loader):
+        """Initialize ExtractTable class with preloaded models."""
+        try:
+            self.feature_extractor, self.model = model_loader.load_table_model()
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
+            logging.info("Table model loaded successfully.")
+        except Exception as e:
+            logging.error(f"Error loading table model: {e}")
+            raise
+
+    def crop_image(self, image: Image.Image, coordinates: List[int]) -> Image.Image:
+        """Crops an image based on given coordinates."""
+        if len(coordinates) != 4:
+            raise ValueError("Coordinates list must contain exactly 4 values: [x1, y1, x2, y2]")
+        return image.crop((coordinates[0], coordinates[1], coordinates[2], coordinates[3]))
+
+    def file_to_base64(self, file_path: str) -> str:
+        """Convert a file to a Base64 string."""
+        try:
+            with open(file_path, "rb") as file:
+                return base64.b64encode(file.read()).decode("utf-8")
+        except Exception as e:
+            logging.error(f"Error encoding file to base64: {e}")
+            raise
+
+    def base64_to_file(self, base64_string: str) -> bytes:
+        """Convert a Base64 string back to bytes."""
+        return base64.b64decode(base64_string)
+
+    def get_table_cells(self, results: Dict[str, Any], table_bbox_list: List[int]) -> Dict[str, Any]:
+        """Extracts table cell coordinates from detection results."""
+        try:
+            rows, columns, headers = [], [], []
+            table_bounds = None
+
+            for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+                box = [int(i) for i in box.tolist()]
+                label_name = self.model.config.id2label[label.item()]
+
+                if label_name == "table":
+                    table_bounds = box
+                elif label_name == "table row":
+                    rows.append(box)
+                elif label_name == "table column":
+                    columns.append(box)
+                elif label_name == "table column header":
+                    headers.append(box)
+
+            rows.sort(key=lambda x: x[1])  # Sort rows by y-coordinate
+            columns.sort(key=lambda x: x[0])  # Sort columns by x-coordinate
+
+            cells = []
+            width_x, height_y = table_bbox_list[:2]
+
+            for i in range(len(rows)-1):
+                for j in range(len(columns)-1):
+                    cell = {
+                        'row': i, 'col': j,
+                        'coordinates': [columns[j][0] + width_x, rows[i][1] + height_y,
+                                        columns[j+1][0] + width_x, rows[i+1][1] + height_y]
+                    }
+                    cells.append(cell)
+            return {'cells': cells, 'table_bounds': table_bounds, 'rows': rows, 'columns': columns, 'headers': headers}
+        except Exception as e:
+            logging.error(f"Error extracting table cells: {e}")
+            raise
+
+    def extract_table(self, page_image: Image.Image, table_bbox_list: List[int], words_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extracts table structure and assigns words to their respective cells."""
+        try:
+            w, h = page_image.size
+            cropped_image = self.crop_image(page_image, table_bbox_list)
+            new_size = (table_bbox_list[2] - table_bbox_list[0], table_bbox_list[3] - table_bbox_list[1])
+
+            inputs = self.feature_extractor(images=np.array(cropped_image.convert('RGB')), return_tensors="pt", size=new_size)
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            target_sizes = torch.tensor([cropped_image.size[::-1]]).to(self.device)
+            results = self.feature_extractor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.5)[0]
+
+            table_data = self.get_table_cells(results, table_bbox_list)
+            cells = [{'rowIndex': cell['row']+1, 'columnIndex': cell['col']+1, 'context': "", 'bbox': cell['coordinates']} for cell in table_data['cells']]
+
+            box_map = {i: [] for i in range(len(table_data['cells']))}
+            for word in words_list:
+                word_bbox = word['bbox']
+                for i, cell in enumerate(table_data['cells']):
+                    if self.is_word_in_box(word_bbox, cell['coordinates']):
+                        box_map[i].append(word['content'])
+                        break
+
+            for box_idx, words in box_map.items():
+                cells[box_idx]['context'] = ' '.join(words)
+            
+            return cells
+        except Exception as e:
+            logging.error(f"Error extracting table: {e}")
+            raise
+
+    def is_word_in_box(self, word_bbox: List[int], box_bbox: List[int], threshold: float = 0.6) -> bool:
+        """Check if a word lies at least `threshold`% inside the given box."""
+        x1_w, y1_w, x2_w, y2_w = word_bbox
+        x1_b, y1_b, x2_b, y2_b = box_bbox
+
+        inter_x1, inter_y1 = max(x1_w, x1_b), max(y1_w, y1_b)
+        inter_x2, inter_y2 = min(x2_w, x2_b), min(y2_w, y2_b)
+
+        if inter_x1 < inter_x2 and inter_y1 < inter_y2:
+            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+            word_area = (x2_w - x1_w) * (y2_w - y1_w)
+            return (inter_area / word_area) >= threshold
+        return False
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ###############################################################################################
 
 import os
